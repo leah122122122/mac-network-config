@@ -41,13 +41,25 @@ app_status() {
   return 0
 }
 graceful_quit() {
-  local i expected_pid=$1 expected_start=$2
+  local i process_state expected_pid=$1 expected_start=$2
   app_status && [ "$app_pid" = "$expected_pid" ] && [ -n "$expected_start" ] &&
     [ "$(ps -p "$expected_pid" -o lstart= 2>/dev/null)" = "$expected_start" ] || return 1
   osascript -l JavaScript "$script_dir/lib/mac-app-control.js" quit "$app" "$expected_pid" >/dev/null 2>&1 || return 1
   for ((i=0;i<20;i++)); do
     app_status || return 1
-    [ -n "$app_pid" ] || return 0
+    if [ -z "$app_pid" ]; then
+      # AppKit may unregister the app before its process finishes shutting down.
+      # Zombies have already exited; a reused PID must never be controlled.
+      if ! process_state=$(ps -p "$expected_pid" -o stat= 2>/dev/null); then
+        # A failed inspection alone is not proof that the process exited.
+        kill -0 "$expected_pid" 2>/dev/null && return 1
+        return 0
+      fi
+      case "$process_state" in '') return 1;; *Z*) return 0;; esac
+      [ "$(ps -p "$expected_pid" -o lstart= 2>/dev/null)" = "$expected_start" ] || return 0
+    elif [ "$app_pid" != "$expected_pid" ]; then
+      return 1
+    fi
     sleep 1
   done
   return 1

@@ -41,12 +41,19 @@ import os,sys,json,signal,time
 from pathlib import Path
 state=Path(os.environ['MOCK_APP_STATE'])
 app=str(Path(__file__).resolve().parents[2])
+events=Path(os.environ['MOCK_EVENTS'])
+def record(event):
+    with events.open('a') as f: f.write(json.dumps({'event':event,'pid':os.getpid()})+'\n')
+record('start')
 data={'pid':os.getpid(),'app':app,'args':sys.argv[1:],'env':{k:os.environ.get(k) for k in ['HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy','ALL_PROXY','all_proxy','NO_PROXY','NODE_OPTIONS','NODE_TLS_REJECT_UNAUTHORIZED']}}
 state.write_text(json.dumps(data))
 def close(*_):
     try:
         if json.loads(state.read_text())['pid']==os.getpid(): state.unlink()
     except (OSError,ValueError): pass
+    record('unregistered')
+    if os.environ['MOCK_SCENARIO']=='delayed_exit': time.sleep(1.3)
+    record('exited')
     sys.exit(0)
 signal.signal(signal.SIGTERM,close)
 for _ in range(1200): time.sleep(.05)
@@ -66,7 +73,7 @@ class LaunchTests(unittest.TestCase):
         self.binary=self.app/'Contents/MacOS/Codex'
         self.binary.write_text('#!'+sys.executable+'\n'+FAKE_APP); self.binary.chmod(0o700)
         self.state=self.root/'app.json'; self.openlog=self.root/'open.json'
-        self.env=dict(os.environ,HOME=str(self.home),MOCK_SCENARIO='ok',MOCK_APP_STATE=str(self.state),MOCK_OPEN_LOG=str(self.openlog),HTTP_PROXY='http://original.invalid:1234',NODE_OPTIONS='original-marker')
+        self.env=dict(os.environ,HOME=str(self.home),MOCK_SCENARIO='ok',MOCK_APP_STATE=str(self.state),MOCK_OPEN_LOG=str(self.openlog),MOCK_EVENTS=str(self.root/'events.jsonl'),HTTP_PROXY='http://original.invalid:1234',NODE_OPTIONS='original-marker')
         for name in ['uname','id','stat','codesign','PlistBuddy','nc','osascript','open']:
             f=self.bin/name; f.write_text('#!'+sys.executable+'\n'+MOCK); f.chmod(0o700)
         s=(ROOT/'try-codex-proxy.command').read_text()
@@ -161,6 +168,22 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(json.loads(self.state.read_text())['pid'],pid)
         self.assertTrue(self.session.exists()); self.assertFalse(self.openlog.exists())
 
+    def test_restart_waits_for_unregistered_process_to_exit(self):
+        self.env['MOCK_SCENARIO']='delayed_exit'
+        old=subprocess.Popen([str(self.binary)],env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            if self.state.exists(): break
+            time.sleep(.01)
+        code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
+        old.wait(timeout=4)
+        new_pid=json.loads(self.state.read_text())['pid']
+        events=[json.loads(line) for line in (self.root/'events.jsonl').read_text().splitlines()]
+        old_exit=next(i for i,e in enumerate(events) if e['pid']==old.pid and e['event']=='exited')
+        new_start=next(i for i,e in enumerate(events) if e['pid']==new_pid and e['event']=='start')
+        self.assertLess(old_exit,new_start)
+        code,out,err=self.run_tool('RESTORE\n',True); self.assertEqual(code,0,out+err)
+        self.assertTrue(self.openlog.exists())
+
     def test_quit_refusal_never_force_kills(self):
         old=subprocess.Popen([str(self.binary)],env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         for _ in range(100):
@@ -223,14 +246,51 @@ class GuardTests(unittest.TestCase):
         harness=r'''const fs=require('fs'),vm=require('vm');
 const code=fs.readFileSync(process.argv[1],'utf8');
 let terminated=false;
-const app={bundleIdentifier:'com.openai.codex',bundleURL:{path:'/a.app'},processIdentifier:123,get terminate(){terminated=true;return true;}};
+const app={bundleIdentifier:'com.openai.codex',bundleURL:{path:'/a.app'},processIdentifier:123,terminate(){terminated=true;return true;}};
 const context={ObjC:{import(){},unwrap(x){return x;}},$:{NSWorkspace:{sharedWorkspace:{runningApplications:{js:[app]}}}}};
 vm.createContext(context);vm.runInContext(code,context);
 if(context.run(['status','/a.app'])!=='123')throw Error('status');
 if(context.run(['quit','/a.app','123'])!=='requested'||!terminated)throw Error('quit');
 let refused=false;try{context.run(['quit','/other.app','123']);}catch(e){refused=true;}if(!refused)throw Error('wrong target');
 terminated=false;refused=false;try{context.run(['quit','/a.app','456']);}catch(e){refused=true;}if(!refused||terminated)throw Error('changed pid');
+app.terminate=function(){terminated=true;return false;};
+terminated=false;refused=false;try{context.run(['quit','/a.app','123']);}catch(e){refused=true;}if(!refused||!terminated)throw Error('termination refusal');
+app.terminate=function(){terminated=true;return true;};
+app.bundleIdentifier='com.other.app';terminated=false;
+if(context.run(['quit','/a.app','123'])!=='requested'||terminated)throw Error('wrong identity');
+app.bundleIdentifier='com.openai.codex';
+context.$.NSWorkspace.sharedWorkspace.runningApplications.js=[app,app];
+refused=false;try{context.run(['quit','/a.app','123']);}catch(e){refused=true;}if(!refused||terminated)throw Error('multiple instances');
 '''
         subprocess.run([node,'-e',harness,str(ROOT/'lib/mac-app-control.js')],check=True)
+
+    def test_quit_wait_timeout_and_instance_change(self):
+        source=(ROOT/'try-codex-proxy.command').read_text()
+        function=source[source.index('graceful_quit() {'):source.index('\nvalidate_app()')]
+        for scenario in ['timeout','different_pid','unregistered_but_alive','inspection_failed']:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                harness=r'''
+app=/a.app; script_dir=/unused; checks=0; sleeps=0; requests=0
+app_status() {
+  checks=$((checks+1))
+  app_pid=123
+  if [ "$checks" -gt 1 ]; then
+    case "$scenario" in different_pid) app_pid=456;; unregistered_but_alive|inspection_failed) app_pid='';; esac
+  fi
+}
+osascript() {
+  [ "$4" = quit ] && [ "$5" = /a.app ] && [ "$6" = 123 ] || exit 90
+  requests=$((requests+1))
+}
+ps() { case "$4" in lstart=) echo original-start;; stat=) [ "$scenario" != inspection_failed ] || return 1; echo S;; *) exit 91;; esac; }
+kill() { [ "$1" = -0 ] || exit 92; return 0; }
+sleep() { sleeps=$((sleeps+1)); }
+'''
+                harness+='\nscenario='+scenario+'\n'+function+'\n'
+                harness+='graceful_quit 123 original-start\nresult=$?\nprintf "%s %s %s" "$result" "$sleeps" "$requests"\n'
+                p=subprocess.run(['bash','-c',harness],capture_output=True,text=True,timeout=3,check=True)
+                result,sleeps,requests=p.stdout.split()
+                self.assertEqual(result,'1'); self.assertEqual(requests,'1')
+                self.assertEqual(sleeps,'0' if scenario in ('different_pid','inspection_failed') else '20')
 
 if __name__=='__main__': unittest.main(verbosity=2)
