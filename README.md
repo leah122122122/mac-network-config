@@ -1,8 +1,44 @@
-# Mac Codex 重连诊断（v2）
+# Mac Codex 显式代理启动对照与网络诊断
 
-适用于 Mac + Clash Verge：网页能用，但桌面 Codex 在发送消息后反复「正在重新连接」。当前交付是**只读诊断工具**，不会自动修改代理、DNS、配置、证书或应用；没有宣称已修复。开发环境是 Linux 云端，不是你的 Mac。
+适用于 Mac + Clash Verge：网页能用，但桌面 Codex 在发送消息后反复「正在重新连接」。诊断入口保持只读；新增一次可撤销的桌面显式代理启动对照。开发环境是 Linux 云端，没有宣称你的 Mac 已修复。
 
-## 第一次只执行一条命令
+## 已提供 v2 结果：这次只运行显式代理启动对照
+
+本入口用于已有报告提示「无显式代理较差，7897 代理路径较好」的情况，只验证桌面实际采用显式代理后能否回复。旧工具连接阶段上限为 5 秒，达到该上限不能单独证明节点失效。本仓库不保存或发布个人实测报告。不会要求更改 Clash 节点、订阅、TUN、DNS 或规则，也不重跑全面诊断。
+
+**没有核对实际应用版本时，不能确认某个稳定 OpenAI 桌面代理配置承诺适用，因此本入口只是一项补充测试，不是已确认支持的持久配置修复器。** 它直接验证同一个桌面应用能否在明确指定 HTTP 代理后回复。
+
+先重新 Download ZIP，解压并用新版文件夹替换原同名文件夹（保留 `lib/`），然后在 Mac 终端只执行：
+
+```bash
+/bin/bash "$HOME/Downloads/mac-network-config-main/try-codex-proxy.command"
+```
+
+工具识别应用和 Electron 版本，校验 OpenAI 签名与 `com.openai.codex` 身份，显示本次启动变更。**先保存桌面工作，再输入 TEST 确认**，之后才正常退出并重开应用。不强制杀进程；应用不响应退出或身份不明时停止。若安装位置不同，可把这个 `.command` 拖到 `/bin/bash ` 后运行；多份安装或其他打包方式会安全停止，不猜测配置路径。
+
+本次只给新桌面进程设置 `HTTP_PROXY/HTTPS_PROXY` 及小写形式为 `http://127.0.0.1:7897`，清除该子进程的 ALL_PROXY/WS_PROXY/WSS_PROXY，把 NO_PROXY 限定为回环；同时传 Electron `--proxy-server` 和回环 bypass 参数。仅在新子进程清除 NODE_OPTIONS、TLS 禁用与 Electron 调试/Node 模式变量。原终端、launchd、系统和浏览器均不改。不会替换 provider、改 WebSocket transport、读取/改写 `.env`、config.toml 或应用内部文件，也不读取登录凭据。应用本身照常使用自己的登录和工作数据，并可能正常写入这些数据，工具不收集其输出或日志。
+
+依据与边界：
+
+- [Electron 官方代理参数](https://www.electronjs.org/docs/latest/api/command-line-switches#--proxy-serveraddressport) 明确该参数覆盖系统代理，适用于 HTTP、HTTPS 和 WebSocket；这是**框架支持**，不是 OpenAI 对任意桌面构建的保证。工具检查本机是否确实是该框架，仍需本次应用实测验证是否被组件覆盖。
+- [OpenAI 桌面启动器源码](https://github.com/openai/codex/blob/8c076942cb70fba8e5c4732c23f1faabc4aed484/codex-rs/cli/src/desktop_app/mac.rs) 提供桌面 bundle/signing 身份依据；[其 WebSocket dialer 源码](https://github.com/openai/codex/blob/8c076942cb70fba8e5c4732c23f1faabc4aed484/codex-rs/websocket-client/src/dialer.rs) 有代理环境处理。这不能证明你捆绑的后端与主分支一致，不将 CLI 选项当桌面配置。
+- 当前 app/框架版本的读取只确认测试对象，不等于已经确认整个桌面端采用了代理；不写入开发中的 `respect_system_proxy`，不添加未经证实的 config 键。
+
+**验证仅做这一项实际应用测试：** 新建桌面对话发送「只回复 OK」，再发两条短消息，观察 10 分钟能否持续回复；同时在原浏览器刷新 ChatGPT 并发送一条消息。终端最后输入 OK / FAIL 记录结果，不会代发任务或读取回复。若失败不要重复启动或切换设置，只反馈工具显示的应用版本、Electron 版本与结果。
+
+**一条命令恢复：**
+
+```bash
+/bin/bash "$HOME/Downloads/mac-network-config-main/restore-codex-proxy.command"
+```
+
+保存工作后输入 RESTORE。恢复只正常退出通过 PID、启动时间、应用路径与文件校验识别的测试实例；原来运行时普通重开，原来未运行时保持关闭，不会关闭后来启动的其他实例。也可直接正常退出测试应用，再从 Finder/Dock 打开，即不带工具参数。若应用自动更新、进程记录不完整或身份变化，工具拒绝自动控制，按这条手动正常退出/打开的方法撤销即可。
+
+没有改配置，所以无需复制可能含密钥的配置文件，也没有此类“配置备份”。确认后会在 `~/Library/Application Support/mac-network-config/desktop-proxy-test/active/` 私有保存原运行状态、应用版本、二进制校验值和测试进程身份，供安全恢复；不保存环境原值、令牌或应用日志。恢复不回滚正常产生的聊天/工作区数据，不把未改过的配置覆盖回旧版本。成功也只对这次启动生效；尚不安装常驻服务或改变 Dock 启动方式。
+
+云端完成脚本语法、JXA API 模拟和进程生命周期测试；没有真实 Mac/Apple AppKit/Electron/LaunchServices 实测，也没有你的已认证回复结果。**不能宣称已修复或长期稳定。** 开发测试命令：`python3 tests/test_proxy_launch.py`；普通用户不用运行或安装 Python。
+
+## 尚未诊断的用户：v2 只读诊断入口
 
 1. 打开 [GitHub 仓库](https://github.com/leah122122122/mac-network-config)，点 **Code → Download ZIP**，双击 ZIP 解压。请重新下载 v2 的完整文件夹，不能只替换单个 `.sh`，需要保留 `lib/`。
 2. 按 **⌘＋空格**，输入「终端」打开。Clash 保持平时状态；你已试过系统代理和 TUN，这一轮无需再切换。
@@ -94,7 +130,7 @@ Mixed 端口可同时验证两种协议，但测试通过不能保证 Codex 自�
 
 ## 修复为什么暂时不执行
 
-你已要求先拿到 Mac 结果再决定修复，本次没有提供可直接改配置的修复入口。详见 [技术研究](docs/RESEARCH.md) 和 [待确认的修复与恢复方案](docs/REPAIR_PLAN.md)。上游源码有开发中 `respect_system_proxy` 功能，不等于目标桌面版本的稳定官方修复；社区全局 launchctl 方案也会影响其他 GUI 应用。
+持久配置修复仍没有自动执行入口；当前提供的单次桌面启动对照见本页开头。详见 [技术研究](docs/RESEARCH.md) 和 [待确认的修复与恢复方案](docs/REPAIR_PLAN.md)。上游源码有开发中 `respect_system_proxy` 功能，不等于目标桌面版本的稳定官方修复；社区全局 launchctl 方案也会影响其他 GUI 应用。
 
 下一步根据本机证据选择一项最小对照。只有核对版本和支持范围、列出具体变更及风险、先备份并提供恢复步骤、得到你逐项确认后，才考虑制作和执行单独修复程序。不改变 provider、base URL、WebSocket transport，不改应用内部，不先清理登录状态、重装或重置网络。
 
