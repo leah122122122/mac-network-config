@@ -1,5 +1,7 @@
 # Mac Codex 显式代理启动对照与网络诊断
 
+**新版 ChatGPT for macOS 整合应用：当前不能确认旧 Electron／独立 Codex 代理启动参数适用，已暂停为 ChatGPT 加这些参数。下一步只运行 `/bin/bash "$HOME/Downloads/mac-network-config-main/inspect-chatgpt.command"`，读取 `/Applications/ChatGPT.app` 的真实身份、签名及框架证据，并把短输出发回聊天。它不启动/退出应用，不联网、不写配置或报告。下方历史启动对照不代表已确认整合版兼容；TEST／RESTORE 仍为旧入口保留。**
+
 适用于 Mac + Clash Verge：网页能用，但桌面 Codex 在发送消息后反复「正在重新连接」。诊断入口保持只读；新增一次可撤销的桌面显式代理启动对照。开发环境是 Linux 云端，没有宣称你的 Mac 已修复。
 
 ## 已提供 v2 结果：这次只运行显式代理启动对照

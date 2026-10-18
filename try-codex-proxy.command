@@ -23,6 +23,17 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$(uname -s)" = Darwin ] || { echo '请在你的 Mac 本机运行。没有执行启动或修改。' >&2; exit 1; }
 [ "$(id -u)" -ne 0 ] || { echo '不要使用 sudo，请以普通用户运行。' >&2; exit 1; }
+# Integrated ChatGPT is a separate compatibility target. Do not infer proxy
+# support from its name, bundle ID, or an embedded Electron framework.
+if [ "$mode" = test ]; then
+  integrated_target=${requested_app:-/Applications/ChatGPT.app}
+  integrated_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$integrated_target/Contents/Info.plist" 2>/dev/null || :)
+  integrated_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$integrated_target/Contents/Info.plist" 2>/dev/null || :)
+  if [ -d "$integrated_target" ] && { [ "$(basename "$integrated_target")" = ChatGPT.app ] || [ "$integrated_name" = ChatGPT ] || [ "$integrated_id" = com.openai.chat ]; }; then
+    echo '整合版 ChatGPT 的代理启动已暂停：先核实真实身份与该版本的官方代理支持；不进入 TEST、不退出应用。'
+    exec /bin/bash "$script_dir/inspect-chatgpt.command" --app "$integrated_target"
+  fi
+fi
 [ -t 0 ] || { echo '需要交互式 Mac 终端确认，禁止无确认执行。' >&2; exit 1; }
 for tool in codesign osascript nc stat shasum ps open nohup; do
   command -v "$tool" >/dev/null 2>&1 || { echo "缺少系统工具 $tool，已停止。" >&2; exit 1; }
@@ -108,6 +119,14 @@ validate_app() {
       case "$app_identifier" in ''|*[!0-9A-Za-z._-]*) app_identifier='未识别/格式异常';; esac
       app_reject bundle-ID "实际为 $app_identifier；不在允许的 Codex/ChatGPT 身份列表。"; return 1;;
   esac
+  if [ "$mode" = test ]; then
+    local product_name
+    product_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist" 2>/dev/null || :)
+    if [ "$app_identifier" = com.openai.chat ] || [ "$product_name" = ChatGPT ] || [ "$(basename "$app")" = ChatGPT.app ]; then
+      app_reject 兼容性待确认 '这是 ChatGPT 应用；不能凭 bundle ID 或框架推断整合版 Codex 支持启动参数。请只运行 inspect-chatgpt.command。'
+      return 1
+    fi
+  fi
   requirement="identifier \"$app_identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\""
   # Verify the signed main application and resource seal, matching the upstream
   # launcher. Recursive --deep rejects some independently packaged runtimes.

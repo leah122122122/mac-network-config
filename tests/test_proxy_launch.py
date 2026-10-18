@@ -10,6 +10,7 @@ from pathlib import Path
 name=Path(sys.argv[0]).name; args=sys.argv[1:]; scenario=os.environ['MOCK_SCENARIO']
 state=Path(os.environ['MOCK_APP_STATE'])
 if name=='uname': print('Darwin')
+elif name=='xcode-select': print(os.environ.get('MOCK_DEVELOPER_DIR',''))
 elif name=='id': print('501')
 elif name=='stat':
     value=os.stat(args[-1]); print('501' if args[1]=='%u' else format(stat.S_IMODE(value.st_mode),'o'))
@@ -19,6 +20,9 @@ elif name=='codesign':
     assert '--verify' in args and '--strict' in args
     if args[-1].endswith('.framework'):
         sys.exit(1 if scenario=='bad_framework' else 0)
+    if '-R' not in args or args[args.index('-R')+1] in ('anchor apple generic','anchor apple'):
+        if args[-1].endswith('/otool') and scenario=='untrusted_tool': sys.exit(1)
+        sys.exit(1 if scenario=='bad_signature' else 0)
     assert '-R' in args
     requirement=args[args.index('-R')+1]
     assert '2DC432GLL2' in requirement and 'anchor apple generic' in requirement
@@ -99,12 +103,15 @@ class LaunchTests(unittest.TestCase):
         self.binary.write_text('#!'+sys.executable+'\n'+FAKE_APP); self.binary.chmod(0o700)
         self.state=self.root/'app.json'; self.openlog=self.root/'open.json'
         self.env=dict(os.environ,HOME=str(self.home),MOCK_SCENARIO='ok',MOCK_APP_STATE=str(self.state),MOCK_OPEN_LOG=str(self.openlog),MOCK_EVENTS=str(self.root/'events.jsonl'),HTTP_PROXY='http://original.invalid:1234',NODE_OPTIONS='original-marker')
-        for name in ['uname','id','stat','codesign','PlistBuddy','nc','osascript','open','mdfind']:
+        for name in ['uname','id','stat','codesign','PlistBuddy','nc','osascript','open','mdfind','xcode-select']:
             f=self.bin/name; f.write_text('#!'+sys.executable+'\n'+MOCK); f.chmod(0o700)
         s=(ROOT/'try-codex-proxy.command').read_text()
         s=s.replace('PATH=/usr/bin:/bin:/usr/sbin:/sbin',f'PATH="{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin"').replace('/usr/libexec/PlistBuddy','"'+str(self.bin/'PlistBuddy')+'"')
         self.script=self.root/'try-codex-proxy.command'; self.script.write_text(s)
         shutil.copy2(ROOT/'restore-codex-proxy.command',self.root/'restore-codex-proxy.command')
+        inspect=(ROOT/'inspect-chatgpt.command').read_text()
+        inspect=inspect.replace('PATH=/usr/bin:/bin:/usr/sbin:/sbin',f'PATH="{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin"').replace('/usr/libexec/PlistBuddy','"'+str(self.bin/'PlistBuddy')+'"')
+        (self.root/'inspect-chatgpt.command').write_text(inspect)
         (self.root/'lib').mkdir(); shutil.copy2(ROOT/'lib/mac-app-control.js',self.root/'lib/mac-app-control.js')
         self.session=self.home/'Library/Application Support/mac-network-config/desktop-proxy-test/active'
         config=self.home/'.codex'; config.mkdir()
@@ -221,13 +228,44 @@ class LaunchTests(unittest.TestCase):
         code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
         self.assertEqual(json.loads(self.state.read_text())['app'],str(nested))
 
-    def test_verified_chat_bundle_can_launch_and_restore(self):
+    def test_integrated_chat_bundle_is_not_proxy_launched(self):
         (self.app/'Contents/Info.plist').write_text(json.dumps({'CFBundleIdentifier':'com.openai.chat'}))
-        code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
-        self.assertIn('已识别桌面应用：com.openai.chat',out)
-        self.assertEqual((self.session/'bundle-id').read_text().strip(),'com.openai.chat')
-        self.assertEqual(self.run_tool('RESTORE\n',True)[0],0)
-        self.assertFalse(self.state.exists())
+        code,out,err=self.run_tool(); self.assertNotEqual(code,0,out+err)
+        self.assertIn('兼容性待确认',out+err)
+        self.assertFalse(self.state.exists()); self.assertFalse(self.session.exists())
+
+    def test_named_chatgpt_with_codex_id_only_inspects(self):
+        renamed=self.app.with_name('ChatGPT.app')
+        shutil.move(self.app,renamed)
+        p=subprocess.run(['bash',str(self.script),'--app',str(renamed)],env=self.env,input='TEST\nFAIL\n',text=True,capture_output=True,timeout=10)
+        self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        self.assertIn('最小只读身份检测',p.stdout)
+        self.assertNotIn('输入 TEST',p.stdout)
+        self.assertFalse(self.state.exists()); self.assertFalse(self.session.exists())
+
+    def test_probe_reports_unknown_identity_without_launching(self):
+        (self.app/'Contents/Info.plist').write_text(json.dumps({'CFBundleIdentifier':'org.actual.integrated','CFBundleName':'ChatGPT'}))
+        p=subprocess.run(['bash',str(self.root/'inspect-chatgpt.command'),'--app',str(self.app)],env=self.env,text=True,capture_output=True,timeout=10)
+        self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        self.assertIn('Bundle ID：org.actual.integrated',p.stdout)
+        self.assertIn('代理启动兼容性尚未确认',p.stdout)
+        self.assertFalse(self.state.exists()); self.assertFalse(self.session.exists())
+
+    def test_probe_static_imports_require_verified_app_and_tool(self):
+        tool=self.root/'developer/usr/bin/otool'; tool.parent.mkdir(parents=True)
+        marker=self.root/'otool-invoked'
+        tool.write_text('#!'+sys.executable+'\nfrom pathlib import Path\nPath('+repr(str(marker))+').touch()\nprint("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit")\n')
+        tool.chmod(0o700)
+        self.env['MOCK_DEVELOPER_DIR']=str(self.root/'developer')
+        for scenario,invoked in [('ok',True),('untrusted_tool',False),('bad_signature',False)]:
+            with self.subTest(scenario=scenario):
+                self.env['MOCK_SCENARIO']=scenario
+                marker.unlink(missing_ok=True)
+                p=subprocess.run(['bash',str(self.root/'inspect-chatgpt.command'),'--app',str(self.app)],env=self.env,text=True,capture_output=True,timeout=10)
+                self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+                self.assertEqual(marker.exists(),invoked)
+                self.assertEqual('链接：AppKit' in p.stdout,invoked)
+                self.assertFalse(self.state.exists()); self.assertFalse(self.session.exists())
 
     def test_framework_versions_directory_and_build_metadata(self):
         manifest=self.app/'Contents/Frameworks/Electron Framework.framework/Resources/Info.plist'
