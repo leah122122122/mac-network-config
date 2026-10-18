@@ -36,7 +36,7 @@ private_path() {
   { [ "$(stat -f '%Lp' "$1" 2>/dev/null)" = 700 ] || [ "$(stat -f '%Lp' "$1" 2>/dev/null)" = 600 ]; }
 }
 app_status() {
-  app_pid=$(osascript -l JavaScript "$script_dir/lib/mac-app-control.js" status "$app" 2>/dev/null) || return 1
+  app_pid=$(osascript -l JavaScript "$script_dir/lib/mac-app-control.js" status "$app" "${app_identifier:-com.openai.codex}" 2>/dev/null) || return 1
   case "$app_pid" in *[!0-9]*|0) return 1;; esac
   return 0
 }
@@ -44,7 +44,7 @@ graceful_quit() {
   local i process_state expected_pid=$1 expected_start=$2
   app_status && [ "$app_pid" = "$expected_pid" ] && [ -n "$expected_start" ] &&
     [ "$(ps -p "$expected_pid" -o lstart= 2>/dev/null)" = "$expected_start" ] || return 1
-  osascript -l JavaScript "$script_dir/lib/mac-app-control.js" quit "$app" "$expected_pid" >/dev/null 2>&1 || return 1
+  osascript -l JavaScript "$script_dir/lib/mac-app-control.js" quit "$app" "$expected_pid" "${app_identifier:-com.openai.codex}" >/dev/null 2>&1 || return 1
   for ((i=0;i<20;i++)); do
     app_status || return 1
     if [ -z "$app_pid" ]; then
@@ -64,34 +64,112 @@ graceful_quit() {
   done
   return 1
 }
-validate_app() {
-  local plist identifier engine
-  [ -d "$app/Contents/MacOS" ] && [ -f "$app/Contents/Info.plist" ] || return 1
-  app=$(CDPATH= cd -- "$app" && pwd -P) || return 1
-  plist="$app/Contents/Info.plist"
-  identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null) || return 1
-  [ "$identifier" = com.openai.codex ] || return 1
-  # Same OpenAI signing identity as the official macOS desktop launcher.
-  codesign --verify --deep --strict -R 'identifier "com.openai.codex" and anchor apple generic and certificate leaf[subject.OU] = "2DC432GLL2"' "$app" >/dev/null 2>&1 || return 1
-  executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist" 2>/dev/null) || return 1
-  case "$executable" in ''|.|..|*/*|*$'\n'*|*$'\r'*) return 1;; esac
-  binary="$app/Contents/MacOS/$executable"
-  [ -f "$binary" ] && [ -x "$binary" ] || return 1
-  app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist" 2>/dev/null) || return 1
-  case "$app_version" in ''|*[!0-9A-Za-z.+_-]*) return 1;; esac
-  binary_hash=$(shasum -a 256 "$binary" 2>/dev/null) || return 1
-  binary_hash=${binary_hash%% *}
-  # Inspect packaged framework metadata, not app code, credentials or guessed config.
-  engine="$app/Contents/Frameworks/Electron Framework.framework/Resources/Info.plist"
-  [ -f "$engine" ] || engine="$app/Contents/Frameworks/Electron Framework.framework/Versions/A/Resources/Info.plist"
-  if [ ! -f "$engine" ]; then
-    echo "已验证 com.openai.codex 版本=$app_version，但未检测到 Electron 框架；不套用框架代理参数。"
-    return 1
-  fi
-  electron_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$engine" 2>/dev/null) || return 1
-  case "$electron_version" in ''|*[!0-9.]*) return 1;; esac
+app_reject() {
+  validation_stage=$1; validation_detail=$2
+  return 1
+}
+show_rejection() {
+  printf '未采用 %q：[%s] %s\n' "$app" "$validation_stage" "$validation_detail"
+}
+consider_electron_manifest() {
+  local manifest=$1 framework_id framework_executable framework_root
+  [ -f "$manifest" ] || return 1
+  framework_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$manifest" 2>/dev/null || :)
+  framework_executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$manifest" 2>/dev/null || :)
+  [ "$framework_id" = com.github.Electron.framework ] || [ "$framework_executable" = 'Electron Framework' ] || return 1
+  framework_root=$(CDPATH= cd -- "$(dirname -- "$manifest")" && pwd -P) || return 1
+  case "$framework_root" in "$app"/Contents/Frameworks/*) :;; *) engine_failure='框架元数据指向应用包之外。'; return 2;; esac
+  while [ "$framework_root" != "$app/Contents/Frameworks" ]; do
+    case "$framework_root" in *.framework) break;; esac
+    framework_root=$(dirname -- "$framework_root")
+  done
+  case "$framework_root" in *.framework) :;; *) engine_failure='识别到 Electron 元数据，但不在有效 framework 包中。'; return 2;; esac
+  # Verify the framework actually used for this test, rather than recursively
+  # rejecting every independently packaged runtime elsewhere in the application.
+  codesign --verify --strict "$framework_root" >/dev/null 2>&1 || { engine_failure='Electron 框架签名或资源完整性校验失败。'; return 2; }
+  # Versions/A is not guaranteed; framework version metadata is informational.
+  electron_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$manifest" 2>/dev/null || :)
+  [ -n "$electron_version" ] || electron_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$manifest" 2>/dev/null || :)
+  case "$electron_version" in ''|*[!0-9A-Za-z.+_-]*) electron_version='未提供（框架身份已识别）';; esac
   return 0
 }
+validate_app() {
+  local plist executable_real signed_team requirement engine count=0
+  validation_stage=''; validation_detail=''; app_identifier=''; electron_version=''; engine_failure=''
+  case "$app" in *$'\n'*|*$'\r'*) app_reject 路径 '路径含换行，不自动处理。'; return 1;; esac
+  [ -d "$app" ] || { app_reject 安装路径 '目录不存在或不可访问。'; return 1; }
+  app=$(CDPATH= cd -- "$app" && pwd -P) || { app_reject 安装路径 '无法解析真实安装位置。'; return 1; }
+  plist="$app/Contents/Info.plist"
+  [ -f "$plist" ] && [ -d "$app/Contents/MacOS" ] || { app_reject 应用结构 '缺少 Contents/Info.plist 或 MacOS 目录。'; return 1; }
+  app_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null) || { app_reject bundle-ID '无法读取 CFBundleIdentifier。'; return 1; }
+  case "$app_identifier" in
+    com.openai.codex|com.openai.chat) :;;
+    *)
+      case "$app_identifier" in ''|*[!0-9A-Za-z._-]*) app_identifier='未识别/格式异常';; esac
+      app_reject bundle-ID "实际为 $app_identifier；不在允许的 Codex/ChatGPT 身份列表。"; return 1;;
+  esac
+  requirement="identifier \"$app_identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\""
+  # Verify the signed main application and resource seal, matching the upstream
+  # launcher. Recursive --deep rejects some independently packaged runtimes.
+  # Neither bundle ID nor discovery metadata alone authorizes execution.
+  if ! codesign --verify --strict -R "$requirement" "$app" >/dev/null 2>&1; then
+    signed_team=$(codesign -d --verbose=4 "$app" 2>&1 | awk -F= '$1=="TeamIdentifier" && $2~/^[A-Z0-9]+$/ {print $2;exit}')
+    if [ -n "$signed_team" ] && [ "$signed_team" != 2DC432GLL2 ]; then
+      app_reject 签名团队 "实际团队 $signed_team，不是允许的 OpenAI 团队 2DC432GLL2。"
+    else
+      app_reject 签名完整性 '主应用签名、资源封印或 OpenAI 签名要求未通过；不启动。'
+    fi
+    return 1
+  fi
+  executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist" 2>/dev/null) || { app_reject 可执行文件 '缺少 CFBundleExecutable。'; return 1; }
+  case "$executable" in ''|.|..|*/*|*$'\n'*|*$'\r'*) app_reject 可执行文件 'CFBundleExecutable 格式不安全。'; return 1;; esac
+  binary="$app/Contents/MacOS/$executable"
+  [ -f "$binary" ] && [ -x "$binary" ] || { app_reject 可执行文件 '声明的程序不存在或不可执行。'; return 1; }
+  executable_real=$(CDPATH= cd -- "$(dirname -- "$binary")" && pwd -P) || return 1
+  case "$executable_real" in "$app"/Contents/MacOS) :;; *) app_reject 可执行文件 '可执行目录指向应用包之外。'; return 1;; esac
+  [ ! -L "$binary" ] || { app_reject 可执行文件 '主程序是符号链接，不自动执行。'; return 1; }
+  app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist" 2>/dev/null || :)
+  [ -n "$app_version" ] || app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist" 2>/dev/null || :)
+  case "$app_version" in ''|*[!0-9A-Za-z.+_-]*) app_version='未提供';; esac
+  binary_hash=$(shasum -a 256 "$binary" 2>/dev/null) || { app_reject 完整性记录 '无法计算程序校验值。'; return 1; }
+  binary_hash=${binary_hash%% *}
+  for engine in "$app/Contents/Frameworks/Electron Framework.framework/Resources/Info.plist" "$app/Contents/Frameworks/Electron Framework.framework/Versions/A/Resources/Info.plist"; do
+    consider_electron_manifest "$engine" && return 0
+    [ -z "$engine_failure" ] || { app_reject 框架完整性 "$engine_failure"; return 1; }
+  done
+  if [ -d "$app/Contents/Frameworks" ]; then
+    while IFS= read -r -d '' engine; do
+      count=$((count+1)); [ "$count" -le 256 ] || break
+      consider_electron_manifest "$engine" && return 0
+      [ -z "$engine_failure" ] || { app_reject 框架完整性 "$engine_failure"; return 1; }
+    done < <(find "$app/Contents/Frameworks" -maxdepth 6 -type f -name Info.plist -print0 2>/dev/null)
+  fi
+  app_reject 框架 "OpenAI 签名已通过，bundle=$app_identifier，版本=$app_version；未找到可识别的 Electron 框架，可能是原生应用或不同打包方式，不能安全套用 Electron 参数。"
+  return 1
+}
+discover_apps() {
+  local path root registered
+  discovered=()
+  # Running apps and LaunchServices can find renamed/relocated bundles.
+  if registered=$(osascript -l JavaScript "$script_dir/lib/mac-app-control.js" discover 2>/dev/null); then
+    while IFS= read -r path; do [ -z "$path" ] || discovered+=("$path"); done <<< "$registered"
+  else
+    echo '提示：运行应用/LaunchServices 查询未成功，继续使用 Spotlight 和目录候选；不跳过真实性检查。'
+  fi
+  if command -v mdfind >/dev/null 2>&1; then
+    while IFS= read -r -d '' path; do
+      discovered+=("$path")
+    done < <(mdfind -0 'kMDItemContentType == "com.apple.application-bundle" && (kMDItemCFBundleIdentifier == "com.openai.codex" || kMDItemCFBundleIdentifier == "com.openai.chat" || kMDItemFSName == "*Codex*.app"cd || kMDItemFSName == "ChatGPT.app"cd)' 2>/dev/null)
+  fi
+  # Non-indexed standard installations, including renamed/nested .app folders.
+  for root in /Applications "$HOME/Applications"; do
+    [ -d "$root" ] || continue
+    while IFS= read -r -d '' path; do discovered+=("$path"); done < <(find "$root" -maxdepth 4 -type d -iname '*.app' -prune \( -iname '*codex*.app' -o -iname '*chatgpt*.app' \) -print0 2>/dev/null)
+  done
+  # Fixed paths are fallback candidates, not the discovery boundary.
+  discovered+=(/Applications/ChatGPT.app /Applications/Codex.app "$HOME/Applications/ChatGPT.app" "$HOME/Applications/Codex.app")
+}
+
 archive_session() {
   local destination
   destination=$(mktemp -d "$state_root/finished-XXXXXX") || return 1
@@ -105,7 +183,12 @@ if [ "$mode" = restore ]; then
   done
   app=$(cat "$session/app-path")
   case "$app" in /*.app) :;; *) fail '启动记录中的应用路径不合法。';; esac
-  validate_app || fail '应用身份、签名或框架已变化，未操作应用。请正常退出测试应用后从 Finder 打开。'
+  validate_app || { show_rejection; fail '未操作应用。请正常退出测试应用后从 Finder 打开。'; }
+  if [ -f "$session/bundle-id" ]; then
+    private_path "$session/bundle-id" && [ "$(cat "$session/bundle-id")" = "$app_identifier" ] || fail '恢复记录与当前 bundle ID 不符，未操作应用。'
+  else
+    [ "$app_identifier" = com.openai.codex ] || fail '旧恢复记录只允许原 com.openai.codex 身份。'
+  fi
   [ "$(cat "$session/binary-hash")" = "$binary_hash" ] || fail '应用已更新，不控制旧 PID。请正常退出应用后从 Finder 打开即可撤销本次启动参数。'
   original_pid=$(cat "$session/original-pid")
   if [ "$original_pid" = not-running ]; then
@@ -152,17 +235,48 @@ fi
 [ ! -e "$session" ] || fail '已有启动记录。请运行 restore-codex-proxy.command，避免重复启动。'
 if [ -n "$requested_app" ]; then
   app=$requested_app
-  validate_app || fail '指定应用未通过正版 com.openai.codex + Electron 元数据检查；未启动，也未改配置。'
+  validate_app || { show_rejection; fail '指定应用不满足安全启动条件；未执行程序。'; }
 else
-  candidates=()
-  for candidate in /Applications/ChatGPT.app /Applications/Codex.app "$HOME/Applications/ChatGPT.app" "$HOME/Applications/Codex.app"; do
+  echo '自动发现：当前运行应用、LaunchServices、Spotlight 及标准应用目录；候选仍须逐项验证。'
+  echo '路径可能含用户名；如需分享失败原因，请先脱敏。'
+  discover_apps
+  candidates=(); checked=(); running_candidates=(); missing_paths=()
+  for candidate in "${discovered[@]}"; do
     app=$candidate
-    if validate_app; then candidates+=("$app"); fi
+    if [ -d "$app" ]; then
+      normalized=$(CDPATH= cd -- "$app" && pwd -P) && app=$normalized
+    fi
+    duplicate=no
+    for seen_path in "${checked[@]}"; do [ "$seen_path" != "$app" ] || duplicate=yes; done
+    [ "$duplicate" = no ] || continue
+    checked+=("$app")
+    if validate_app; then
+      printf '通过：%q；bundle=%s；版本=%s；Electron=%s\n' "$app" "$app_identifier" "$app_version" "$electron_version"
+      candidates+=("$app")
+      if app_status && [ -n "$app_pid" ]; then running_candidates+=("$app"); fi
+    elif [ "$validation_stage" = 安装路径 ]; then
+      missing_paths+=("$app")
+    else
+      show_rejection
+    fi
   done
-  [ "${#candidates[@]}" -gt 0 ] || fail '未找到通过身份/签名/Electron 检查的桌面应用。本轮没有版本兼容性依据，已停止。自定义安装位置可用 --app 指定，不猜测配置路径。'
-  [ "${#candidates[@]}" -eq 1 ] || fail '找到多份正版应用，无法确定你正在使用哪一份。请用 --app 指定实际应用；未更改任何内容。'
-  app=${candidates[0]}
-  validate_app || fail '应用验证失败，已停止。'
+  if [ "${#candidates[@]}" -eq 0 ]; then
+    for missing_path in "${missing_paths[@]}"; do printf '[安装路径] %q 不存在或不可访问。\n' "$missing_path"; done
+    fail '未找到可安全进行 Electron 代理测试的应用；发现应用不等于签名或框架已通过。未退出或启动任何应用。'
+  elif [ "${#running_candidates[@]}" -eq 1 ]; then
+    app=${running_candidates[0]}
+    echo '优先使用当前运行且已通过真实性/框架校验的应用。'
+  elif [ "${#candidates[@]}" -eq 1 ]; then
+    app=${candidates[0]}
+  else
+    echo '发现多份已验证应用，请选择你实际使用的一份（此时不会启动）：'
+    for ((index=0;index<${#candidates[@]};index++)); do printf '%s) %q\n' "$((index+1))" "${candidates[$index]}"; done
+    printf '输入编号，其他输入取消：'; read -r choice
+    case "$choice" in ''|*[!0-9]*) fail '已取消。';; esac
+    [ "${#choice}" -le 4 ] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#candidates[@]}" ] || fail '编号不在范围内，已取消。'
+    app=${candidates[$((10#$choice-1))]}
+  fi
+  validate_app || { show_rejection; fail '所选应用发生变化，未执行程序。'; }
 fi
 app_status || fail '无法安全识别当前桌面实例，或另一份安装正在运行；已停止。'
 original_pid=$app_pid
@@ -172,7 +286,7 @@ if [ -n "$original_pid" ]; then
   [ -n "$original_start" ] || fail '无法确认原进程启动时间，已停止。'
 fi
 nc -z -G 2 -w 2 127.0.0.1 7897 >/dev/null 2>&1 || fail '本机 7897 未监听，不能进行这一次显式代理启动测试。未更改设置。'
-echo "已识别桌面应用：com.openai.codex；应用版本=$app_version；Electron=$electron_version。"
+echo "已识别桌面应用：$app_identifier；应用版本=$app_version；Electron=$electron_version。"
 echo '版本/框架检查只确认测试对象，不能证明该应用所有组件会采用这些参数；本次启动是唯一兼容性对照。'
 echo '将执行：'
 echo '  1. 保存本地版本/原运行状态记录；不复制含凭据的配置或登录文件（配置不会修改）。'
@@ -196,6 +310,7 @@ mkdir "$session" || fail '已有并行启动记录，已停止。'
 {
   printf '%s\n' "$app" > "$session/app-path" &&
   printf '%s\n' "$binary_hash" > "$session/binary-hash" &&
+  printf '%s\n' "$app_identifier" > "$session/bundle-id" &&
   printf '%s\n' "$app_version" > "$session/app-version" &&
   printf '%s\n' "$electron_version" > "$session/electron-version" &&
   printf '%s\n' "${original_pid:-not-running}" > "$session/original-pid" &&

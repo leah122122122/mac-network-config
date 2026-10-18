@@ -14,26 +14,49 @@ elif name=='id': print('501')
 elif name=='stat':
     value=os.stat(args[-1]); print('501' if args[1]=='%u' else format(stat.S_IMODE(value.st_mode),'o'))
 elif name=='codesign':
-    assert '--verify' in args and '--strict' in args and '-R' in args
-    assert '2DC432GLL2' in args[args.index('-R')+1]
-    sys.exit(1 if scenario=='bad_signature' else 0)
+    if '-d' in args:
+        print('TeamIdentifier='+('OTHERTEAM1' if scenario=='wrong_team' else '2DC432GLL2')); sys.exit(0)
+    assert '--verify' in args and '--strict' in args
+    if args[-1].endswith('.framework'):
+        sys.exit(1 if scenario=='bad_framework' else 0)
+    assert '-R' in args
+    requirement=args[args.index('-R')+1]
+    assert '2DC432GLL2' in requirement and 'anchor apple generic' in requirement
+    if scenario=='independent_runtime' and '--deep' in args: sys.exit(1)
+    sys.exit(1 if scenario in ('bad_signature','wrong_team') else 0)
 elif name=='PlistBuddy':
     key=args[1].split(':')[-1]
-    print({'CFBundleIdentifier':'com.other.app' if scenario=='wrong_app' else 'com.openai.codex','CFBundleExecutable':'Codex','CFBundleShortVersionString':'39.0.0' if 'Electron' in args[-1] else '26.1007.30912'}[key])
+    framework='Electron' in args[-1]
+    values={'CFBundleIdentifier':'com.github.Electron.framework' if framework else 'com.other.app' if scenario=='wrong_app' else 'com.openai.codex','CFBundleExecutable':'Electron Framework' if framework else 'Codex','CFBundleShortVersionString':'39.0.0' if framework else '26.1007.30912','CFBundleVersion':'39.1.0' if framework else '1234'}
+    try: values.update(json.loads(Path(args[-1]).read_text()))
+    except ValueError: pass
+    if scenario=='build_only' and key=='CFBundleShortVersionString': sys.exit(1)
+    if scenario=='no_framework_version' and framework and key in ('CFBundleShortVersionString','CFBundleVersion'): sys.exit(1)
+    if key not in values: sys.exit(1)
+    print(values[key])
 elif name=='nc':
     assert args[-2:]==['127.0.0.1','7897']; sys.exit(1 if scenario=='no_port' else 0)
 elif name=='osascript':
+    if args[3]=='discover':
+        if state.exists(): print(json.loads(state.read_text())['app'])
+        for path in json.loads(os.environ.get('MOCK_DISCOVERY_PATHS','[]')): print(path)
+        sys.exit(0)
     action,path=args[3:5]; assert action in ['status','quit']
     if scenario=='status_failed': sys.exit(1)
     if state.exists():
         data=json.loads(state.read_text())
         if data['app']!=path: sys.exit(1)
+        identifier=args[5] if action=='status' and len(args)>5 else args[6] if action=='quit' and len(args)>6 else 'com.openai.codex'
+        if data.get('bundle','com.openai.codex')!=identifier: sys.exit(0)
         if action=='status': print(data['pid'])
         elif scenario=='quit_refused' or args[5]!=str(data['pid']): sys.exit(1)
         else: os.kill(data['pid'],signal.SIGTERM)
 elif name=='open':
     assert args[0]=='-a' and len(args)==2
     Path(os.environ['MOCK_OPEN_LOG']).write_text(json.dumps({'app':args[1],'HTTP_PROXY':os.environ.get('HTTP_PROXY'),'NODE_OPTIONS':os.environ.get('NODE_OPTIONS')}))
+elif name=='mdfind':
+    assert args[0]=='-0'
+    for path in json.loads(os.environ.get('MOCK_SPOTLIGHT_PATHS','[]')): sys.stdout.write(path+'\0')
 else: raise AssertionError(name)
 '''
 FAKE_APP=r'''
@@ -46,6 +69,8 @@ def record(event):
     with events.open('a') as f: f.write(json.dumps({'event':event,'pid':os.getpid()})+'\n')
 record('start')
 data={'pid':os.getpid(),'app':app,'args':sys.argv[1:],'env':{k:os.environ.get(k) for k in ['HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy','ALL_PROXY','all_proxy','NO_PROXY','NODE_OPTIONS','NODE_TLS_REJECT_UNAUTHORIZED']}}
+try: data['bundle']=json.loads((Path(app)/'Contents/Info.plist').read_text()).get('CFBundleIdentifier','com.openai.codex')
+except ValueError: data['bundle']='com.openai.codex'
 state.write_text(json.dumps(data))
 def close(*_):
     try:
@@ -74,7 +99,7 @@ class LaunchTests(unittest.TestCase):
         self.binary.write_text('#!'+sys.executable+'\n'+FAKE_APP); self.binary.chmod(0o700)
         self.state=self.root/'app.json'; self.openlog=self.root/'open.json'
         self.env=dict(os.environ,HOME=str(self.home),MOCK_SCENARIO='ok',MOCK_APP_STATE=str(self.state),MOCK_OPEN_LOG=str(self.openlog),MOCK_EVENTS=str(self.root/'events.jsonl'),HTTP_PROXY='http://original.invalid:1234',NODE_OPTIONS='original-marker')
-        for name in ['uname','id','stat','codesign','PlistBuddy','nc','osascript','open']:
+        for name in ['uname','id','stat','codesign','PlistBuddy','nc','osascript','open','mdfind']:
             f=self.bin/name; f.write_text('#!'+sys.executable+'\n'+MOCK); f.chmod(0o700)
         s=(ROOT/'try-codex-proxy.command').read_text()
         s=s.replace('PATH=/usr/bin:/bin:/usr/sbin:/sbin',f'PATH="{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin"').replace('/usr/libexec/PlistBuddy','"'+str(self.bin/'PlistBuddy')+'"')
@@ -150,6 +175,102 @@ class LaunchTests(unittest.TestCase):
         shutil.rmtree(self.app/'Contents/Frameworks')
         code,out,err=self.run_tool(); self.assertNotEqual(code,0,out+err)
         self.assertFalse(self.session.exists()); self.assertFalse(self.state.exists())
+        self.assertIn('[框架]',out+err)
+        self.assertIn('OpenAI 签名已通过',out+err)
+
+    def relocate_app(self,name='Renamed Desktop.app'):
+        new_app=self.root/'custom install'/name
+        new_app.parent.mkdir(parents=True,exist_ok=True)
+        shutil.move(str(self.app),new_app)
+        self.app=new_app; self.binary=self.app/'Contents/MacOS/Codex'
+
+    def test_spotlight_discovers_relocated_renamed_app_and_restores(self):
+        self.relocate_app()
+        self.env['MOCK_SPOTLIGHT_PATHS']=json.dumps([str(self.app)])
+        code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
+        self.assertEqual(json.loads(self.state.read_text())['app'],str(self.app))
+        self.assertEqual(self.run_tool('RESTORE\n',True)[0],0)
+        self.assertFalse(self.state.exists())
+
+    def test_registered_app_and_symlink_deduplicate(self):
+        self.relocate_app('Code Work.app')
+        alias=self.root/'Alias.app'; alias.symlink_to(self.app,target_is_directory=True)
+        self.env['MOCK_DISCOVERY_PATHS']=json.dumps([str(self.app),str(alias)])
+        self.env['MOCK_SPOTLIGHT_PATHS']=json.dumps([str(alias)])
+        code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
+        self.assertNotIn('输入编号',out)
+        self.assertEqual(json.loads(self.state.read_text())['app'],str(self.app))
+        self.assertEqual(self.run_tool('RESTORE\n',True)[0],0)
+
+    def test_running_unindexed_relocated_app_is_preferred(self):
+        self.relocate_app('Desktop With New Name.app')
+        old=subprocess.Popen([str(self.binary)],env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            if self.state.exists(): break
+            time.sleep(.01)
+        code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
+        old.wait(timeout=4)
+        self.assertIn('优先使用当前运行',out)
+        self.assertEqual(self.run_tool('RESTORE\n',True)[0],0)
+
+    def test_renamed_nested_standard_installation(self):
+        nested=self.home/'Applications/Tools/Codex Preview.app'
+        nested.parent.mkdir()
+        shutil.move(str(self.app),nested); self.app=nested
+        self.binary=self.app/'Contents/MacOS/Codex'
+        code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
+        self.assertEqual(json.loads(self.state.read_text())['app'],str(nested))
+
+    def test_verified_chat_bundle_can_launch_and_restore(self):
+        (self.app/'Contents/Info.plist').write_text(json.dumps({'CFBundleIdentifier':'com.openai.chat'}))
+        code,out,err=self.run_tool(); self.assertEqual(code,0,out+err)
+        self.assertIn('已识别桌面应用：com.openai.chat',out)
+        self.assertEqual((self.session/'bundle-id').read_text().strip(),'com.openai.chat')
+        self.assertEqual(self.run_tool('RESTORE\n',True)[0],0)
+        self.assertFalse(self.state.exists())
+
+    def test_framework_versions_directory_and_build_metadata(self):
+        manifest=self.app/'Contents/Frameworks/Electron Framework.framework/Resources/Info.plist'
+        other=manifest.parent.parent/'Versions/B/Resources/Info.plist'
+        other.parent.mkdir(parents=True); shutil.move(str(manifest),other)
+        self.env['MOCK_SCENARIO']='build_only'
+        code,out,err=self.run_tool('NO\n'); self.assertEqual(code,0,out+err)
+        self.assertIn('Electron=39.1.0',out); self.assertIn('应用版本=1234',out)
+        self.assertFalse(self.state.exists())
+
+    def test_missing_framework_version_is_not_authenticity_failure(self):
+        self.env['MOCK_SCENARIO']='no_framework_version'
+        code,out,err=self.run_tool('NO\n'); self.assertEqual(code,0,out+err)
+        self.assertIn('未提供（框架身份已识别）',out)
+        self.assertFalse(self.state.exists())
+
+    def test_independent_runtime_does_not_require_recursive_deep_verify(self):
+        self.env['MOCK_SCENARIO']='independent_runtime'
+        code,out,err=self.run_tool('NO\n'); self.assertEqual(code,0,out+err)
+        self.assertIn('输入 TEST',out)
+
+    def test_detailed_rejection_does_not_execute(self):
+        for scenario,reason in [('wrong_app','[bundle-ID]'),('bad_signature','[签名完整性]'),('wrong_team','[签名团队]'),('bad_framework','[框架完整性]')]:
+            with self.subTest(scenario=scenario):
+                self.env['MOCK_SCENARIO']=scenario
+                code,out,err=self.run_tool(); self.assertNotEqual(code,0)
+                self.assertIn(reason,out+err)
+                self.assertFalse(self.session.exists()); self.assertFalse(self.state.exists())
+
+    def test_no_app_reports_missing_paths(self):
+        shutil.rmtree(self.app)
+        code,out,err=self.run_tool(); self.assertNotEqual(code,0)
+        self.assertIn('[安装路径]',out+err)
+        self.assertFalse(self.session.exists()); self.assertFalse(self.state.exists())
+
+    def test_multiple_verified_copies_require_selection(self):
+        second=self.root/'other/Codex.app'; second.parent.mkdir()
+        shutil.copytree(self.app,second)
+        self.env['MOCK_SPOTLIGHT_PATHS']=json.dumps([str(second),str(self.app)])
+        code,out,err=self.run_tool('1\nTEST\nFAIL\n'); self.assertEqual(code,0,out+err)
+        self.assertIn('输入编号',out)
+        self.assertEqual(json.loads(self.state.read_text())['app'],str(second))
+        self.assertEqual(self.run_tool('RESTORE\n',True)[0],0)
 
     def test_existing_app_graceful_restart(self):
         old=subprocess.Popen([str(self.binary)],env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -246,9 +367,11 @@ class GuardTests(unittest.TestCase):
         harness=r'''const fs=require('fs'),vm=require('vm');
 const code=fs.readFileSync(process.argv[1],'utf8');
 let terminated=false;
-const app={bundleIdentifier:'com.openai.codex',bundleURL:{path:'/a.app'},processIdentifier:123,terminate(){terminated=true;return true;}};
-const context={ObjC:{import(){},unwrap(x){return x;}},$:{NSWorkspace:{sharedWorkspace:{runningApplications:{js:[app]}}}}};
+const url=path=>({path,URLByResolvingSymlinksInPath:{path}});
+const app={bundleIdentifier:'com.openai.codex',bundleURL:url('/a.app'),processIdentifier:123,terminate(){terminated=true;return true;}};
+const context={ObjC:{import(){},unwrap(x){return x;}},$:{NSWorkspace:{sharedWorkspace:{runningApplications:{js:[app]},URLForApplicationWithBundleIdentifier(id){return url(id==='com.openai.codex'?'/a.app':'/registered.app');}}}}};
 vm.createContext(context);vm.runInContext(code,context);
+if(context.run(['discover'])!=='/a.app\n/registered.app')throw Error('discovery/deduplication');
 if(context.run(['status','/a.app'])!=='123')throw Error('status');
 if(context.run(['quit','/a.app','123'])!=='requested'||!terminated)throw Error('quit');
 let refused=false;try{context.run(['quit','/other.app','123']);}catch(e){refused=true;}if(!refused)throw Error('wrong target');
@@ -261,6 +384,11 @@ if(context.run(['quit','/a.app','123'])!=='requested'||terminated)throw Error('w
 app.bundleIdentifier='com.openai.codex';
 context.$.NSWorkspace.sharedWorkspace.runningApplications.js=[app,app];
 refused=false;try{context.run(['quit','/a.app','123']);}catch(e){refused=true;}if(!refused||terminated)throw Error('multiple instances');
+context.$.NSWorkspace.sharedWorkspace.runningApplications.js=[app];
+app.bundleIdentifier='com.openai.chat';terminated=false;
+if(context.run(['status','/a.app','com.openai.chat'])!=='123')throw Error('chat identity status');
+if(context.run(['quit','/a.app','123','com.openai.chat'])!=='requested'||!terminated)throw Error('chat identity quit');
+terminated=false;refused=false;try{context.run(['quit','/a.app','123','com.other.app']);}catch(e){refused=true;}if(!refused||terminated)throw Error('unsupported explicit identity');
 '''
         subprocess.run([node,'-e',harness,str(ROOT/'lib/mac-app-control.js')],check=True)
 
