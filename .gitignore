@@ -1,0 +1,7 @@
+# Diagnostic reports are local-only, never commit them.
+work/
+reports/
+run-*/
+报告*.txt
+diagnostic-report*.txt
+.DS_Store
